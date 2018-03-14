@@ -1,0 +1,537 @@
+---
+title: "ICES 2018 vms data-call"
+author: "Einar Hjörleifsson"
+output:
+  html_document:
+    fig_height: 6
+    fig_width: 9
+  pdf_document: default
+  word_document: default
+subtitle: Processing Icelandic data
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, error = FALSE)
+```
+
+# Preamble
+
+At the Marine and Freshwater Research Institute, Reykjavík one has access to two data sources related to fishing operation:
+
+* Conventional captain logbook database achieved by the Fisheries Institute, were each activity (vessel id, tow, setting, time, catch by species, etc.) is mandatory recorded, irrespective of gear or vessel size.
+* A database of VMS/AIS pings by vessel id, it being primarily used in real time to monitor all vessel location by the Coast Guard but archived by the Fisheries Institute. No distinction in the view that has been made accessible to some MRI scientist is with respect to the original source of the date.
+
+Both these data-sources are stored within different schema insides the same Oracle database. Given that at least for towed gear the start and end time of each tow is recorded, one can link the two data sources by the event-interval approach:
+
+* Each ping in the vms database is a time event
+* Each setting in the logbook database is identifiable as a time interval
+
+Under the assumption that the time interval is properly recorded any vms ping that falls within a specified logbook time interval can be considered as being fishing activity.
+
+# Raw data processing
+
+* __Conventional captains logbooks__: For towed bottom contact gear (with the exception of Scottish seine), the following variables were used:
+    - Operation id (serialized computer number, unique for each fishing activity)
+    - Vessel id
+    - Vessel length (available for all vessels in the National Vessel Registry)
+    - Vessel power (observed and for some predicted/assumed from vessel length - power relationship of available data)
+    - Gear used (metiers identified as bottom fish-trawl, nephrops trawl, shrimp trawl and scallop dredges)
+    - Mesh size: For nephrops and dredge gear the mesh size was set to 80 and 100 mm respectively. For bottom fish trawl, if reported mesh size was 155 mm it was used, otherwise mesh size was set to 135 mm. For shrimp trawl, if reported mesh size was 36 mm it was used, otherwise mesh size was set to 40 mm.
+    - Start time (at the resolution of yyyymmdd-hhmm)
+    - End time (at the resolution of yyyymmdd-hhmm for the majority of settings)
+    - For the bottom trawl gear the recorded bridle length in each tow was used as a proxy for door spread. This approximation was based on ad-hoc interview with selected captains in the fleet as well as from discussions with the gear specialist at the MRI. For dredges the recorded width of the gear was used.
+    - Catch composition by species
+    
+* __VMS/AIS data__:
+    - The data are event/ping (at the resolution of yyyymmdd-hhmmss), lon, lat, speed, heading and vessel id
+    - The data were initially filtered only with respect to longitude and latitude values outside possible range.
+    - A linear interpolation between pings was done if the interval between pings was greater than 9 minutes, position then interpolated for every 6 minutes.
+    - Each event/ping of a vessel was linked to an operational id from the conventional captains __logbooks__ using the recorded interval of the operation. If an event (ping) did not fall within a recorded __logbook__ operation it was retained, but recorded as `NA`. This allowed one to use the "raw" data-set to calculate vms-parameters that were not necessarily associated with fishing.
+    - Each ping was allocated as belonging to one of the following (TRUE or FALSE)
+        - Within FAO area 27 (ICES area)
+        - Within OSPAR region
+        - Within 3 miles of Icelandic harbors
+        - Within Icelandic EEZ
+        - Within regions where fish trawling is forbidden by law
+        - Within regions where trawling is forbidden by regulations
+
+The __raw__ data processing was done within a single R script, using:
+
+* A year loop
+* Ping allocation to area was done by spreading the task across 35 processor
+
+# Filtering and additional processing
+
+The vms data were filtered by the following criteria:
+
+* ping falls within a fishing activity interval (id is not NA)
+* ping falls within either ices or ospar area
+* ping is not within 3 miles from harbor
+* ping not on land
+* ping is associated with bottom trawl or dredge gear
+* speeds that fall outside 95% of the distribution within a gear class (metier level 5) were cut. This cuts out records of where captains reported too long tows - forgot to state that the tow had ended.
+  
+The vms and logbook data were linked through the unique fishing activity id and the catches and effort (tow-duration) spread across the vms pings associated with each fishing operation. The data were then summarized according to the specification in the data call with the additional statistics of mean door spread being calculated.
+
+The proportion of the logbook tows that are also in the vms data has been increasing from 0.86 in 2009 to around on 0.93 in 2016 (see Table below). Similar trends and values can be observed in the catches and effort (towtime). The reason why the coverage within the vms data is not closer to 100% was not resolved prior the 2017 data-call delivery and will explored intersessionally.
+
+NOTE: CODE BELOW NOT RUN - YET
+```{r}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+```{r}
+library(gisland)
+library(viridis)
+library(stringr)
+library(lubridate)
+library(tidyverse)
+```
+
+
+```{r}
+# __Proportions of Logbook records that are in the vms data__:
+load("data/logbooks.rda")
+load("data/vms_logbook_tows_filtered_05min.rda")
+
+# Vessel information -----------------------------------------------------------
+vessel <-
+  Vessel %>%
+  filter(vid %in% unique(vms$vid))
+# approximate kw
+vessel <-
+  vessel %>%
+  mutate(vlngt = cut_width(vessel_length, 5)) %>%
+  group_by(vlngt) %>%
+  mutate(kw_predicted = mean(kw, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(kw = ifelse(is.na(kw), kw_predicted, kw))
+# vessel %>% ggplot(aes(vessel_length, kw)) + geom_point() + geom_smooth()
+
+# ------------------------------------------------------------------------------
+ids_in_vms <- unique(vms$id)
+# Catch ------------------------------------------------------------------------
+catch <-
+  Catch %>%
+  group_by(id) %>%
+  summarise(catch = sum(catch))
+base <-
+  Base %>%
+  filter(gid %in% c(6, 9, 14, 15)) %>%
+  mutate(in.vms = ifelse(id %in% ids_in_vms, TRUE, FALSE),
+         spread = ifelse(vid == 15, pl_breidd, grandarar)) %>%
+  #select(id, towtime, spread) %>%
+  left_join(catch)
+
+base %>% 
+  mutate(year = year(date)) %>% 
+  group_by(year, in.vms) %>% 
+  summarise(tows = n_distinct(id),
+            catch = sum(catch, na.rm = TRUE),
+            effort = sum(towtime, na.rm = TRUE)) %>% 
+  gather(variable, value, tows:effort) %>% 
+  group_by(year, variable) %>% 
+  mutate(p = round(value / sum(value), 2)) %>% 
+  ungroup() %>% 
+  filter(in.vms) %>% 
+  select(year,  variable, p) %>% 
+  spread(variable, p) %>% 
+  knitr::kable()
+```
+
+
+```{r}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+
+```{r}
+#__Number of trawl and dredging vessels, total pings, observed pings associated with fishing and additional interpolated pings__ (pings are in millions):
+load("data/vms_raw.rda")
+vms %>% 
+  mutate(derived = ifelse(!is.na(speed_derived), "n.fishing", "n.interpolated")) %>% 
+  group_by(year, derived) %>% 
+  summarise(n = round(n()/1e6, 3)) %>% 
+  spread(derived, n) %>% 
+  full_join(vms.summary.pings.vessel) %>% 
+  select(year, n.vessels, n.total = n.ping, n.fishing, n.interpolated) %>% 
+  mutate(n.total = round(n.total/1e6, 3)) %>% 
+  knitr::kable()
+```
+
+```{r}
+d <-
+  vms.2016 %>% 
+  arrange(mobileid, date) %>% 
+  group_by(mobileid) %>% 
+  mutate(p.interval = (date - lag(date))/dminutes(1),
+         p.interval = ifelse(is.na(p.interval), lead(date), p.interval)) %>% 
+  ungroup() %>% 
+  mutate(sq = encode(lon, lat, c(0.025, 0.0125))) %>% 
+  group_by(sq) %>% 
+  summarise(p.interval = mean(p.interval, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  separate(sq, c("lon", "lat"), sep = ":", convert = TRUE) %>% 
+  filter(!is.na(lon),
+         !is.na(lat)) %>% 
+  filter(geo_inside(lon, lat, eez))
+d %>% 
+  filter(p.interval < 65) %>% 
+  ggplot() +
+  geom_polygon(data = iceland, aes(long, lat, group = group), fill = "grey") +
+  geom_raster(aes(lon, lat, fill = p.interval)) +
+  coord_quickmap(xlim = c(-30, -10), ylim = c(61.5, 68)) +
+  scale_fill_viridis(option = "B", direction = -1) +
+  scale_x_continuous(NULL, NULL) +
+  scale_y_continuous(NULL, NULL) +
+  labs(title = "Mean ping interval",
+       subtitle = "2016 data raw",
+       fill = "Minutes")
+```
+
+
+```{r}
+load("../vms/data/older_2017_05_14/0_vms_2016.rda") # interpolated stuff
+load("../vms/data/logbooks.rda")
+metier <- 
+  data_frame(gclass = c(6, 9, 14, 15, NA),
+             metier = c("   Fish trawl", "  Nephrops trawl", "  Shrimp trawl", "Dredge", "Not fishing"))
+vms.filtered <-
+  vms %>% 
+  left_join(Base %>% select(id, gclass)) %>% 
+  left_join(metier) %>% 
+  filter((!is.na(vid) | vid != 9999),
+         is.na(in_out_of_harbor),
+         !p.land,
+         !p.harb,
+         gclass %in% c(9, 14, 15, NA) | (gclass == 6 & !p.skip3)) %>% 
+  mutate(fishing = ifelse(!is.na(id), TRUE, FALSE))
+vms.speed <-
+  vms.filtered %>% 
+  filter(metier != "Not fishing") %>% 
+  group_by(metier) %>% 
+  summarise(q025 = quantile(speed, 0.025),
+            median = quantile(speed, 0.5),
+            q975 = quantile(speed, 0.975))
+vms.filtered <-
+  vms.filtered %>% 
+  left_join(vms.speed) %>% 
+  mutate(p.speed = ifelse(speed >= q025 & speed <= q975, TRUE, FALSE))
+vms.filtered %>%
+  filter(speed < 15) %>% 
+  ggplot() +
+  geom_rect(data = vms.speed,
+            aes(xmin = q025, xmax = q975, ymin = -Inf, ymax = Inf),
+                   fill = "pink") +
+  geom_histogram(aes(speed), binwidth = 0.25) +
+  geom_vline(data = vms.speed, aes(xintercept = median), col = "red") +
+  facet_grid(metier ~ ., scale = "free_y") +
+  labs(x = "Speed [knots]", y = "Number of pings",
+       title = "Distribution of speed depending on activity in 2016",
+       subtitle = "Pink shade show the 95% distribution with the median depicted as red")
+```
+
+```{r}
+# here calculate mean door spread by gear metier (not mesh)
+```
+
+
+```{r}
+attach("data/logbooks_full.rda")
+# Code that should have been done earlier
+Gear$Gear <- case_when(Gear$gid == 1 ~ "Long line",
+                       Gear$gid == 2 ~ "Gill net",
+                       Gear$gid == 3 ~ "Hooks",
+                       Gear$gid == 4 ~ "Pelagic seine",
+                       Gear$gid == 5 ~ "Scotish seine",
+                       Gear$gid == 6 ~ "Fish trawl",
+                       Gear$gid == 7 ~ "Pelagic trawl",
+                       Gear$gid == 9 ~ "Nephrops trawl",
+                       Gear$gid == 14 ~ "Shrimp trawl",
+                       Gear$gid == 15 ~ "Dredges",
+                       TRUE ~ "Other")
+Vessel <-
+  Vessel %>%
+  mutate(vessel_length_class = ifelse(vessel_length_class == "<8", "00-08", vessel_length_class),
+         vessel_length_class = ifelse(vessel_length_class == "8-10", "08-10", vessel_length_class),
+         vessel_length_class = ifelse(vessel_length_class == ">=15", "15+", vessel_length_class))
+Catch <-
+  Catch %>% 
+  # NOTE: Need to check
+  mutate(catch = ifelse(sid %in% c(30, 31, 33, 34), catch * 1e3, catch)) %>% 
+  group_by(id) %>% 
+  summarise(catch = sum(catch, na.rm = TRUE)) %>% 
+  ungroup()
+Stofn  <-
+  Stofn %>% 
+  mutate(gid = ifelse(gid %in% c(16, 36, 42), 1, gid),                    # long line
+         gid = ifelse(gid %in% c(11, 25, 29, 32, 72,90,91), 2, gid),# net
+         gid = ifelse(gid %in% c(4, 10, 12, 56, 57), 4, gid),     # seine
+         gid = ifelse(gid %in% c(26, 27), 5, gid),                    # scotish seine
+         gid = ifelse(gid %in% c(22, 31, 66, 68, 73, 74, 76, 77, 78, 8, 139), 6, gid),             # botnvarpa
+         gid = ifelse(gid %in% c(7, 13, 19, 21, 23, 24, 33, 34, 44), 7, gid), # flotvarpa
+         gid = ifelse(gid %in% c(14, 30), 14, gid),                   # rækjuvarpa
+         gid = ifelse(gid %in% c(15, 37, 38, 40, 172, 173), 15, gid),       # dredge
+         gid = ifelse(gid %in% c(17, 18, 39), 17, gid),               # trap
+         gid = ifelse(gid %in% c(20, 41, 45, 99, 43), 20, gid))                      # misc
+         
+
+Stofn %>% 
+  select(id, vid, gid, date) %>% 
+  left_join(Vessel %>% select(vid, vessel_length_class)) %>% 
+  left_join(Catch) %>% 
+  mutate(year = year(date)) %>% 
+  filter(year %in% 2009:2016) %>% 
+  group_by(year, vessel_length_class) %>% 
+  summarise(catch = sum(catch, na.rm = TRUE) / 1e6) %>% 
+  ggplot(aes(year, catch, fill = vessel_length_class)) +
+  geom_col() +
+  scale_fill_brewer(palette = "Set1") +
+  labs(x = NULL, y = NULL, title = "Catch by vessel class",
+       subtitle = "Thousand tonnes", fill = "Vessel length")
+Stofn %>% 
+  select(id, vid, gid, date) %>% 
+  left_join(Catch) %>% 
+  left_join(Gear %>% select(gid, Gear) %>% distinct()) %>% 
+  mutate(year = year(date)) %>% 
+  filter(year %in% 2009:2016) %>% 
+  mutate(Gear = ifelse(Gear %in% c("Gill net", "Hooks"), "Other", Gear)) %>% 
+  group_by(year, Gear) %>% 
+  summarise(catch = sum(catch, na.rm = TRUE) / 1e6) %>% 
+  ggplot(aes(year, catch, fill = Gear)) +
+  geom_col() +
+  scale_fill_brewer(palette = "Set1") +
+  labs(x = NULL, y = NULL, title = "Catch by gear",
+       subtitle = "Thousand tonnes", fill = "Gear")
+```
+
+```{r, eval = FALSE}
+library(dplyrOracle)
+library(mar)
+db <- src_oracle("mar")
+vms.connect <-
+  mar:::stk_vms(db) %>% 
+  filter(year %in% 2009:2016)
+vms.connect %>% 
+  group_by(year) %>% 
+  summarise(n.ping = n(),
+            n.vessels = n_distinct(skip_nr)) %>% 
+  collect() %>% 
+  arrange(year) -> 
+  vms.summary.pings.vessel
+vms.connect %>% 
+  filter(year == 2016) %>% 
+  collect(n = Inf) ->
+  vms.2016
+save(vms.summary.pings.vessel, vms.2016, file = "data/vms_raw.rda")
+```
+
+```{r}
+attach("data/vms_raw.rda")
+```
+
+
+
+```{r}
+attach("data/logbooks_full.rda")
+attach("data/vms_logbook_tows_filtered_05min.rda")
+vms <-
+  vms %>% 
+  left_join(Base %>% select(id, gid))
+
+vms <-
+  vms %>%
+  filter(speed < 20)
+speed <-
+  vms %>%
+  sample_n(1e6) %>% 
+  group_by(gid) %>% 
+  summarise(q025 = quantile(speed, 0.025),
+            q975 = quantile(speed, 0.975))
+vms %>% 
+  sample_n(1e5) %>% 
+  left_join(speed) %>% 
+  select(speed, gid, q025, q975) %>% 
+  ggplot() +
+  geom_histogram(aes(speed), binwidth = 0.5) +
+  facet_grid(gid ~ ., scale = "free_y")
+
+vms <-
+  vms %>% 
+  left_join(speed) %>% 
+  filter(speed >= q025 & speed <= q975) %>% 
+  select(-c(q025, q975))
+
+# recalculate intervals
+vms <-
+  vms %>% 
+  arrange(id, date) %>% 
+  group_by(id) %>% 
+  mutate(p.interval = (date - lag(date))/dminutes(1),
+         p.interval = ifelse(is.na(p.interval), lead(date), p.interval)) %>% 
+  ungroup()
+vms <- 
+  vms %>% 
+  group_by(id) %>% 
+  mutate(p.dist = geo::arcdist(lat, lon, lag(lat), lag(lon)),
+         p.dist = ifelse(is.na(p.dist), 0, p.dist)) %>%   # the first ping
+  ungroup()
+vms <-
+  vms %>% 
+  filter(p.interval < 65,
+         p.dist < 15)
+
+# redo ping interval calculation
+vms <-
+  vms %>% 
+  select(-c(p.interval, p.dist)) %>% 
+  arrange(id, date) %>% 
+  group_by(id) %>% 
+  mutate(p.interval = (date - lag(date))/dminutes(1),
+         p.interval = ifelse(is.na(p.interval), lead(date), p.interval),
+         p.dist = geo::arcdist(lat, lon, lag(lat), lag(lon)),
+         p.dist = ifelse(is.na(p.dist), 0, p.dist))
+vms <-
+  vms %>%
+  mutate(distance = cumsum(p.dist),
+         time = cumsum(p.interval)) %>% 
+  ungroup()
+vms <-
+  vms %>% 
+  mutate(speed_derived = p.dist/(p.interval) * 60) %>% 
+  arrange(id, date)
+
+# get the vessel length
+vessel <- 
+  Vessel %>% 
+  filter(vid %in% unique(vms$vid))
+# approximate kw
+vessel <-
+  vessel %>% 
+  mutate(vlngt = cut_width(vessel_length, 5)) %>% 
+  group_by(vlngt) %>% 
+  mutate(kw_predicted = mean(kw, na.rm = TRUE)) %>% 
+  ungroup() %>% 
+  mutate(kw = ifelse(is.na(kw), kw_predicted, kw))
+vessel %>% ggplot(aes(vessel_length, kw)) + geom_point() + geom_smooth()
+
+vms <-
+  vms %>% 
+  left_join(vessel %>% select(vid, vessel_length, vessel_length_class, kw))
+# finally the csquare
+vms <-
+  vms %>%
+  mutate(csquare = vmstools::CSquare(lon, lat, 0.05))
+
+save(vms, file = "data/vms_logbook_tows_munged.rda")
+```
+
+```{r}
+catch <-
+  Catch %>% 
+  group_by(id) %>% 
+  summarise(catch = sum(catch))
+base <-
+  Base %>%
+  filter(vid %in% unique(vms$vid)) %>% 
+  select(id, towtime) %>% 
+  left_join(catch)
+vms <-
+  vms %>%
+  left_join(base)
+# plit among pings
+vms <-
+  vms %>% 
+  group_by(id) %>% 
+  mutate(towtime = towtime/n(),
+         catch = catch/n()) %>% 
+  ungroup()
+
+# some general overview
+d <-
+  vms %>%
+  group_by(year, csquare) %>% 
+  summarise(n = n(),
+            p.interval = mean(p.interval, na.rm = TRUE),
+            vessel_length = mean(vessel_length),
+            kw = mean(kw),
+            catch = sum(catch, na.rm = TRUE),
+            towtime = sum(towtime)) %>% 
+  ungroup() %>% 
+  mutate(lon = vmstools::CSquare2LonLat(csquare, 0.05)$SI_LONG,
+         lat = vmstools::CSquare2LonLat(csquare, 0.05)$SI_LATI,
+         in.eez = geo_inside(lon, lat, eez))
+d %>% 
+  filter(in.eez, year == 2016) %>% 
+  ggplot() +
+  geom_polygon(data = iceland, aes(long, lat, group = group)) +
+  geom_raster(aes(lon, lat, fill = n)) +
+  coord_quickmap() +
+  viridis::scale_fill_viridis(option = "B", trans = "reverse")
+d %>% 
+  filter(in.eez, year == 2015) %>% 
+  ggplot() +
+  geom_polygon(data = iceland, aes(long, lat, group = group)) +
+  geom_raster(aes(lon, lat, fill = catch/1e3)) +
+  coord_quickmap() +
+  viridis::scale_fill_viridis(option = "B", trans = "reverse")
+d %>% 
+  filter(in.eez, year == 2015) %>% 
+  ggplot() +
+  geom_polygon(data = iceland, aes(long, lat, group = group)) +
+  geom_raster(aes(lon, lat, fill = towtime/(60))) +
+  coord_quickmap() +
+  viridis::scale_fill_viridis(option = "B", trans = "reverse")
+d %>% 
+  filter(in.eez, year == 2015) %>% 
+  ggplot() +
+  geom_polygon(data = iceland, aes(long, lat, group = group)) +
+  geom_raster(aes(lon, lat, fill = vessel_length)) +
+  coord_quickmap() +
+  viridis::scale_fill_viridis(option = "B", trans = "reverse")
+d %>% 
+  filter(in.eez, year == 2015) %>% 
+  ggplot() +
+  geom_polygon(data = iceland, aes(long, lat, group = group)) +
+  geom_raster(aes(lon, lat, fill = kw)) +
+  coord_quickmap() +
+  viridis::scale_fill_viridis(option = "B", trans = "reverse")
+# something rotten in the state of denmark
+d %>% 
+  filter(in.eez, year == 2015) %>% 
+  ggplot() +
+  geom_polygon(data = iceland, aes(long, lat, group = group)) +
+  geom_raster(aes(lon, lat, fill = p.interval)) +
+  coord_quickmap() +
+  viridis::scale_fill_viridis(option = "B", trans = "reverse")
+
+# calculate by csquare
+#  NOTE: HAVE TO DO THIS ALSO BY VESSEL CLASS
+vms2 <-
+  vms %>% 
+  filter(p.ospr) %>% 
+  # should vessel class be included here
+  group_by(year, gclass, csquare) %>% 
+  summarise(n = n(),
+            vessel_length = mean(vessel_length),
+            kw = mean(kw),
+            catch = sum(catch, na.rm = TRUE)/1e3,
+            effort = sum(towtime)) %>% 
+  ungroup() %>%  
+  mutate(lon = vmstools::CSquare2LonLat(csquare, 0.05)$SI_LONG,
+         lat = vmstools::CSquare2LonLat(csquare, 0.05)$SI_LATI,
+         in.eez = geo_inside(lon, lat, eez))
+
+
+vms2 %>% 
+  filter(in.eez,
+         year == 2016) %>% 
+  ggplot() +
+  geom_polygon(data = iceland, aes(long, lat, group = group)) +
+  geom_raster(aes(lon, lat, fill = n)) +
+  coord_quickmap() +
+  viridis::scale_fill_viridis(option = "B", trans = "reverse") +
+  facet_wrap(~ gclass)
+```
+
